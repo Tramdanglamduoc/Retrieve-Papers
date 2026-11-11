@@ -1,0 +1,196 @@
+# SMOKE TEST config - one branch, two years.
+# Run this first:   python pubmed_crawler_v5.py config_smoke.yaml --check
+# Then for real:    python pubmed_crawler_v5.py config_smoke.yaml
+#
+# Writes to ./EyeProject_smoke_mesh - a NEW folder. The old ./EyeProject_smoke
+# holds the title/abstract-only run (92 matched, 88 papers), and every edge in
+# it is tagged "query" by the old code, so re-using it would make the new
+# keyword-vs-mesh columns read as zero. Keep them apart and diff the two.
+#
+# This is a test with a KNOWN ANSWER. The window 2013-2014 contains
+# Ferris et al. 2013, "Clinical classification of age-related macular
+# degeneration" (Ophthalmology) - the Beckman paper.
+#   If Beckman comes back  -> the query works, move to config_v2_identity.yaml
+#   If it does not         -> check the TRUNCATED warnings before calling it
+#                             broken; max_per_query is null here, so there
+#                             should not be any
+#
+# Target for this window with mesh in the query: matched = 184.
+#
+# The real 0.1 run uses 1990-2026, not this window. Foundational
+# classification papers are from 1991, 1995, 2005 and 2013.
+
+contact:
+  email: tnbtram180@gmail.com
+  ncbi_api_key: e3650d2bca6ff004b7539346eea5da11d408    # PASTE the NEW NCBI key between quotes, e.g. "abc123..."  (old key was leaked and must stay revoked).
+                        # null = 3 req/sec. With a key the crawler raises itself to 10 req/sec.
+                        # Never send this file to anyone (chat, git, email) with a real key inside.
+
+# ---- keys for fill_fulltext.py (it reads this block by these exact names) ----
+# Leave null until you have it. Elsevier + Wiley only work from the TMU network / VPN.
+publisher_api:
+  elsevier: null            # Elsevier Developer Portal API key; PENDING (manager / TMU library is checking)
+  elsevier_insttoken: null  # only if Elsevier/the library gave you an institutional token; otherwise keep null
+  wiley: 241f33c8-56a4-47c1-b00b-e84c4d73b21e              # Wiley TDM click-through token (from Crossref with ORCID)
+
+# ---- not read by any script yet: reserved for the OpenAlex route (not written yet) ----
+apis:
+  openalex:
+    api_key: uR9XQk8mOy4yeEMGKW4DLK          # your free OpenAlex key. Do not paste it while this route does not exist.
+
+source:
+  database: PubMed
+
+paths:
+  output: ./EyeProject_smoke_mesh
+  sync_to: null
+
+date_range:
+  from: 2013
+  to: 2013
+  split_by_year: true
+
+search:
+  include_mesh: true    # the mesh lists below go INTO the query, not just tagging.
+                        # false = old behaviour, title/abstract only.
+                        # This key is part of config_hash, so the ledger records
+                        # that a mesh run and a non-mesh run are different searches.
+
+limits:
+  max_per_query: null   # null = fetch every match, paging as needed.
+                        # A number here is a ceiling, and a year that exceeds
+                        # it is truncated newest-first with a warning.
+  batch_size: 50
+  max_attempts: 3
+  ncbi_per_second: 3
+  epmc_per_second: 2
+  # unpaywall_locations: 4   # optional: how many Unpaywall pdf addresses fill_fulltext.py tries per paper (default 4)
+
+download:
+  fulltext: true
+  pdf: true
+  supplementary: false
+  verify_cached: true
+  measure_open_access: true
+  mesh_autotag: true
+
+disease:
+  name: AMD
+  anchor:
+    - age-related macular degeneration
+    - age related macular degeneration
+    - age-related maculopathy
+    - age related maculopathy
+    - macular degeneration
+    - AMD
+    - ARMD
+    - dry AMD
+    - wet AMD
+    - nAMD
+    - neovascular AMD
+    - non-neovascular AMD
+    - nonneovascular AMD
+    - atrophic AMD
+    - exudative AMD
+    - non-exudative AMD
+    - nonexudative AMD
+    - geographic atrophy
+  mesh:
+    # [MeSH Terms] explodes, so Macular Degeneration already covers the two
+    # below. They are kept for readability and cost nothing.
+    - Macular Degeneration
+    - Wet Macular Degeneration
+    - Geographic Atrophy
+    - Retinal Drusen
+
+branches:
+  "0.1_identity":
+    terms:
+
+      # --- definition & criteria ---
+      - disease definition
+      - clinical definition
+      - diagnostic definition
+      - case definition
+      - consensus definition
+      - diagnostic criteria
+      - clinical criteria
+      - case ascertainment
+      - phenotype definition
+
+      # --- naming & terminology ---
+      - nomenclature
+      - consensus nomenclature
+      - terminology
+      - standardized terminology
+      - standardised terminology
+      - lexicon
+
+      # --- classification ---
+      - classification
+      - clinical classification
+      - disease classification
+      - classification system
+      - classification criteria
+      - subtype classification
+      - phenotypic classification
+      - phenotype classification
+
+      # --- stage overlap: keep, but also tag these papers 1.1 Stage ---
+      - grading system
+      - grading criteria
+      - staging system
+      - severity classification
+      - severity scale
+
+      # --- named frameworks: highest precision in the whole branch ---
+      - Beckman classification
+      - Beckman Initiative
+      - Beckman Initiative for Macular Research Classification Committee
+      - international classification and grading system
+      - International ARM Epidemiological Study Group
+      - Wisconsin age-related maculopathy grading system
+      - Wisconsin grading system
+      - AREDS classification
+      - AREDS severity scale
+      - AREDS simplified severity scale
+      - Age-Related Eye Disease Study severity scale
+      - AREDS Report 17
+      - AREDS Report No. 17
+      - AREDS Report 18
+      - AREDS Report No. 18
+      - Consensus on Neovascular Age-Related Macular Degeneration Nomenclature
+      - Classification of Atrophy
+      - Classification of Atrophy Meetings
+      - CAM classification
+      - CAM Report 3
+      - CAM Report 4
+
+    mesh:
+      - Macular Degeneration/classification
+      - Terminology as Topic
+      - Severity of Illness Index
+      # Severity of Illness Index is broad. Watch the mesh_only column in
+      # branch_coverage: if it fills with treatment trials that merely use an
+      # AREDS score, drop this one and keep the other two.
+
+    # ---------------------------------------------------------------------
+    # DELIBERATELY NOT INCLUDED: conditional_expansions
+    #
+    #   macular/choroidal neovascularization, type 1/2/3, occult CNV,
+    #   cRORA, iRORA, cORA, iORA, drusen size, pigmentary abnormalities,
+    #   normal aging changes, drupelets
+    #
+    # These need a three-way AND:
+    #   anchor AND subtype_term AND (definition|criteria|nomenclature|...)
+    #
+    # This flat schema only does  anchor AND (one big OR block),  so dropping
+    # them in here would mean  AMD AND choroidal neovascularization  - which
+    # matches every anti-VEGF trial ever published. The branch would fill with
+    # treatment papers. They go in v2, as stream D, where the AND can be
+    # expressed properly.
+    # ---------------------------------------------------------------------
+
+    # No hard exclusions. An OCT or deep-learning NOT would delete CAM Report 3
+    # (Sadda 2018), which has OCT in its title and is a core definition paper.
+    # Screen on the paper's primary purpose after retrieval instead.
