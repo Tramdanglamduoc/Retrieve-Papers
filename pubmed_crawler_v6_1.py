@@ -25,6 +25,9 @@ tagging afterwards. search.include_mesh: false turns that off.
 Full text is tried in order: Europe PMC xml -> NCBI PMC xml -> Unpaywall pdf
 -> publisher TDM pdf.
 
+Keys can stay out of the yaml: NCBI_API_KEY, ELSEVIER_API_KEY,
+ELSEVIER_INSTTOKEN and WILEY_TDM_TOKEN are read from the environment.
+
     pip install biopython pandas openpyxl requests pyyaml tqdm
     python pubmed_crawler_v6_1.py config.yaml --test-api   # does the API answer?
     python pubmed_crawler_v6_1.py config.yaml --check      # queries, no network
@@ -61,13 +64,16 @@ PARSER_VERSION = 7
 QUERY_METHODS = ("query", "query_mesh")
 
 EPMC = "https://www.ebi.ac.uk/europepmc/webservices/rest/{pmcid}/{what}"
-EPMC_PDF = "https://europepmc.org/articles/{pmcid}?pdf=render"
+# the plain "?pdf=render" page answers 403 to scripts; this is the endpoint behind it
+EPMC_PDF = "https://europepmc.org/backend/ptpmcrender.fcgi?accid={pmcid}&blobtype=pdf"
 EUTILS = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/einfo.fcgi"
 IDCONV = "https://pmc.ncbi.nlm.nih.gov/tools/idconv/api/v1/articles/"
 UNPAYWALL = "https://api.unpaywall.org/v2/{doi}"
 ELSEVIER = "https://api.elsevier.com/content/article/doi/{doi}"
 WILEY = "https://api.wiley.com/onlinelibrary/tdm/v1/articles/{doi}"
-TDM_PREFIXES = {"10.1016": "elsevier", "10.1111": "wiley", "10.1002": "wiley"}
+TDM_PREFIXES = {"10.1016": "elsevier", "10.1111": "wiley", "10.1002": "wiley",
+                "10.5694": "wiley"}       # 10.5694 = Medical Journal of Australia (Wiley)
+PMC_S3 = "https://pmc-oa-opendata.s3.amazonaws.com"   # PMC Cloud Service, open data on AWS
 HEADERS = {"User-Agent": "AMD-knowledge-crawler/6"}
 
 # the smoke test's known answer: Ferris et al. 2013, the Beckman paper
@@ -85,6 +91,10 @@ DOI_PREFIXES = {
     "10.1177": "SAGE", "10.3928": "Healio", "10.1056": "NEJM",
     "10.1073": "PNAS", "10.1126": "AAAS", "10.1101": "Cold Spring Harbor (preprint)",
     "10.1172": "JCI", "10.7150": "Ivyspring", "10.18240": "IJO Press",
+    "10.1001": "JAMA Network", "10.3109": "Taylor & Francis (Informa)",
+    "10.1055": "Thieme", "10.2174": "Bentham Science",
+    "10.7205": "Military Medicine (AMSUS)", "10.5694": "Wiley (MJA)",
+    "10.3341": "Korean Ophthalmological Society",
 }
 
 ACTIONS = {
@@ -103,7 +113,7 @@ RETRY_STATUSES = {"network_blocked", "http_error", "corrupt_file", "embargo"}
 NEW_ROUTE_STATUSES = {"not_in_pmc", "pmc_not_oa"}
 
 PAPER_COLUMNS = [
-    "key", "doi", "pmid", "pmcid", "title", "pub_year", "journal", "publisher",
+    "key", "doi", "pmid", "pmcid", "title", "first_author", "pub_year", "journal", "publisher",
     "doi_url", "pubmed_url", "pmc_url",
     "databases", "n_branches", "branches", "n_leaf_tags", "leaf_tags",
     "in_pmc", "is_open_access",
@@ -111,7 +121,7 @@ PAPER_COLUMNS = [
     "status", "action", "detail", "attempts",
     "first_seen", "first_seen_run", "last_run", "last_attempt", "parser_version",
     "paper_folder", "metadata_path", "fulltext_path",
-    "fulltext_bytes", "fulltext_sha256",
+    "fulltext_bytes", "fulltext_sha256", "fulltext_format",
     "pdf_path", "pdf_bytes",
     "supplementary_path", "supplementary_files",
 ]
@@ -141,10 +151,18 @@ def load_config(path="config.yaml"):
     cfg = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
     for section in ("contact", "paths", "date_range", "limits", "download",
                     "disease", "branches", "search", "publisher_api"):
-        cfg.setdefault(section, {})
+        cfg[section] = cfg.get(section) or {}      # an empty yaml section is None
+
+    # TDM keys may sit in the environment, so the yaml never has to hold them
+    pub = cfg["publisher_api"]
+    for name, env in (("elsevier", "ELSEVIER_API_KEY"),
+                      ("elsevier_insttoken", "ELSEVIER_INSTTOKEN"),
+                      ("wiley", "WILEY_TDM_TOKEN")):
+        pub[name] = pub.get(name) or os.environ.get(env) or None
 
     Entrez.email = cfg["contact"].get("email") or ""
-    Entrez.api_key = cfg["contact"].get("ncbi_api_key") or None
+    # the key may sit in the environment instead of the yaml (NCBI_API_KEY)
+    Entrez.api_key = cfg["contact"].get("ncbi_api_key") or os.environ.get("NCBI_API_KEY") or None
     Entrez.tool = "AMD-knowledge-crawler"
     if not Entrez.email:
         raise SystemExit("contact.email is required - NCBI rejects anonymous use")
@@ -242,6 +260,13 @@ def publisher_from_doi(doi):
     return DOI_PREFIXES.get(doi.split("/")[0], f"unknown ({doi.split('/')[0]})")
 
 
+def is_closed_source(source):
+    """A copy from TDM, the TMU network or a hand download is a subscription
+    copy, not an open one. fill_fulltext.py uses the same rule."""
+    parts = [s for s in (source or "").split(" + ") if s and s != "cached"]
+    return bool(parts) and all("TDM" in s or "TMU" in s or "manual" in s for s in parts)
+
+
 def source_chain(row, fulltext_source):
     found = row.get("found_in") or "PubMed"
     if fulltext_source:
@@ -303,23 +328,47 @@ def paper_stem(row):
 
 
 def paper_dir(cfg, row):
+    # a paper keeps its first folder even if a PMCID turns up later
+    if row.get("paper_folder"):
+        return cfg["_root"] / row["paper_folder"]
     return cfg["_root"] / "papers" / (row.get("pub_year") or "unknown") / paper_stem(row)
 
 
 def rel(cfg, path):
+    # forward slashes, so a ledger written on Windows still works on Mac/Linux
     try:
-        return str(Path(path).relative_to(cfg["_root"]))
+        return Path(path).relative_to(cfg["_root"]).as_posix()
     except (ValueError, TypeError):
         return str(path) if path else ""
 
 
-def write_atomic(path, data):
+PATH_COLUMNS = ("paper_folder", "metadata_path", "fulltext_path", "pdf_path",
+                "supplementary_path")
+
+
+def write_atomic(path, data, wait=60):
+    """Windows refuses to replace a file that is open in Excel; wait for the
+    user to close it instead of crashing in the middle of a run."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     part = path.with_name(path.name + ".part")
     part.write_bytes(data)
-    os.replace(part, path)
-    return path
+    deadline = time.monotonic() + wait
+    warned = False
+    while True:
+        try:
+            os.replace(part, path)
+            return path
+        except PermissionError:
+            if time.monotonic() > deadline:
+                raise SystemExit(f"{path} is still open in another program - close it "
+                                 f"and run again (settled papers are skipped, so the "
+                                 f"rerun picks up where this one stopped)")
+            if not warned:
+                print(f"\n!! {path.name} is open in another program (Excel?) - "
+                      f"close it, waiting up to {wait}s ...")
+                warned = True
+            time.sleep(2)
 
 
 def csv_bytes(frame):
@@ -421,6 +470,9 @@ def load_state(cfg):
     if p.exists():
         for _, row in pd.read_csv(p, dtype=str).fillna("").iterrows():
             entry = dict(row)
+            for col in PATH_COLUMNS:          # older ledgers written on Windows
+                if entry.get(col):
+                    entry[col] = entry[col].replace("\\", "/")
             papers[entry["key"]] = entry
     e = state_path(cfg, "paper_branches.csv")
     if e.exists():
@@ -527,7 +579,7 @@ def should_process(entry, cfg):
     return False, f"{status} needs a human"
 
 
-FILE_COLUMNS = (("fulltext_path", "fulltext_bytes", "fulltext_sha256"),
+FILE_COLUMNS = (("fulltext_path", "fulltext_bytes", "fulltext_sha256", "fulltext_format"),
                 ("pdf_path", "pdf_bytes"),
                 ("supplementary_path", "supplementary_files"))
 
@@ -557,9 +609,51 @@ def update_paper(cfg, papers, index, row, status, detail="", match_method="new")
         "parser_version": str(PARSER_VERSION),
     })
     drop_missing_files(cfg, entry)
+    if not entry["fulltext_path"] and not entry["pdf_path"]:
+        entry["source_fulltext"] = ""          # no file left to have a source
+    entry["fulltext_format"] = (xml_format(cfg["_root"] / entry["fulltext_path"])
+                                if entry["fulltext_path"] else "")
     papers[key] = entry
     index.add(entry)
     return entry
+
+
+def write_metadata(cfg, entry, row):
+    """metadata.json = the parsed record plus a fulltext block. Keys another
+    script added (fill_fulltext's block, the branch tags) are kept."""
+    path = cfg["_root"] / entry["metadata_path"]
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        data = {}
+    data.update(row)
+    xml, pdf = bool(entry.get("fulltext_path")), bool(entry.get("pdf_path"))
+    data["fulltext"] = {**(data.get("fulltext") or {}),
+                        "status": entry["status"], "action": entry["action"],
+                        "tier": "full_text" if xml or pdf else "abstract_only",
+                        "xml": xml, "pdf": pdf,
+                        "xml_format": entry.get("fulltext_format", ""),
+                        "source": entry.get("source_fulltext", ""),
+                        "detail": entry.get("detail", ""),
+                        "updated": entry.get("last_attempt", ""),
+                        "run_id": cfg["_run_id"]}
+    write_atomic(path, json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8"))
+
+
+XML_FORMATS = {"article": "jats", "pmc-articleset": "jats in pmc-articleset",
+               "full-text-retrieval-response": "elsevier"}
+
+
+def xml_format(path):
+    """Which schema a fulltext.xml is in, from its root tag. A pipeline that
+    reads JATS needs to know the Elsevier ones are different."""
+    try:
+        for _, elem in ElementTree.iterparse(path, events=("start",)):
+            tag = elem.tag.rsplit("}", 1)[-1]
+            return XML_FORMATS.get(tag, tag)
+    except (ElementTree.ParseError, OSError):
+        return ""
+    return ""
 
 
 # ---------------------------------------------------------------- queries
@@ -614,10 +708,11 @@ def keyword_hit(row, terms):
     (the three things [Title/Abstract] searches)? If not, the
     paper came in through the MeSH half of the query. Rough on purpose -
     PubMed stems and we do not, so treat it as a signal, not a verdict."""
-    text = re.sub(r"[^a-z0-9]+", " ", f"{row.get('title','')} "
-                                      f"{row.get('abstract','')} "
-                                      f"{row.get('author_keywords','')}".lower())
-    return any(re.sub(r"[^a-z0-9]+", " ", t.lower()).strip() in text
+    text = " " + re.sub(r"[^a-z0-9]+", " ", f"{row.get('title','')} "
+                                            f"{row.get('abstract','')} "
+                                            f"{row.get('author_keywords','')}".lower()) + " "
+    # whole words: "classification" must not hit inside "reclassification"
+    return any(" " + re.sub(r"[^a-z0-9]+", " ", t.lower()).strip() + " " in text
                for t in terms)
 
 
@@ -692,6 +787,18 @@ def count_only(throttle, query):
     return _int(esearch(throttle, term=query, retmax=0).get("Count"), 0)
 
 
+def query_warnings(result):
+    """What PubMed says it ignored. A quoted phrase missing from its phrase
+    index is dropped from the search without an error - only this tells you."""
+    out = []
+    for part in ("WarningList", "ErrorList"):
+        for kind, items in (result.get(part) or {}).items():
+            items = [str(i).strip() for i in (items or []) if str(i).strip()]
+            if items and kind != "OutputMessage":
+                out.append(f"{kind}: {'; '.join(items)}")
+    return out
+
+
 def search(cfg, throttle, query, stats):
     """Page through esearch instead of keeping only the first screen.
 
@@ -705,6 +812,12 @@ def search(cfg, throttle, query, stats):
         if want <= 0:
             break
         result = esearch(throttle, term=query, retstart=start, retmax=want)
+        if start == 0:
+            for msg in query_warnings(result):
+                msg = f"PUBMED IGNORED {msg} | {query[:70]}"
+                if msg not in stats.warnings:
+                    stats.warnings.append(msg)
+                    tqdm.write("  !! " + msg)
         count = _int(result.get("Count"), 0)
         batch = [str(i) for i in result.get("IdList", [])]
         ids.extend(batch)
@@ -1084,6 +1197,8 @@ def save_pdf_from(throttle, url, target, headers=None):
         return False
     if resp.status_code != 200 or not resp.content.startswith(b"%PDF"):
         return False
+    if "warning" in resp.headers.get("X-ELS-Status", "").lower():
+        return False      # Elsevier off-campus: page one only, not the paper
     write_atomic(target, resp.content)
     if not validate_file(target)[0]:
         target.unlink(missing_ok=True)
@@ -1113,11 +1228,14 @@ def fetch_fulltext(cfg, throttles, row, stats):
             target.unlink()
             stats.verified["repaired"] += 1
 
-    unanswered = []
+    unanswered, corrupt = [], ""
     pmcid = row.get("pmcid")
     if pmcid:
         try:
             resp = epmc_get(epmc, pmcid, "fullTextXML")
+        except requests.exceptions.Timeout as exc:
+            # slow, not blocked: an ordinary retry
+            return "http_error", type(exc).__name__, "", {}
         except requests.exceptions.RequestException as exc:
             return "network_blocked", type(exc).__name__, "", {}
         if resp.status_code == 200:
@@ -1126,8 +1244,9 @@ def fetch_fulltext(cfg, throttles, row, stats):
             if ok:
                 return "ok", detail, "Europe PMC (PMC)", _saved(cfg, xml)
             xml.unlink(missing_ok=True)
-            return "corrupt_file", detail, "", {}
-        if resp.status_code not in (401, 403, 404, 500):
+            # a broken answer from Europe PMC: NCBI and Unpaywall may still have it
+            corrupt = detail
+        elif resp.status_code not in (401, 403, 404, 500):
             return "http_error", f"HTTP {resp.status_code}", "", {}
         raw = ncbi_pmc_xml(ncbi, pmcid)
         if raw is None:
@@ -1155,6 +1274,8 @@ def fetch_fulltext(cfg, throttles, row, stats):
     # instead of being filed as "no copy exists"
     if unanswered:
         return "http_error", f"no answer from {', '.join(unanswered)}", "", {}
+    if corrupt:
+        return "corrupt_file", f"Europe PMC xml broken: {corrupt}", "", {}
     if pmcid:
         return "pmc_not_oa", "in PMC, body not retrievable", "", {}
     return "not_in_pmc", "no PMC copy and no open copy found", "", {}
@@ -1246,20 +1367,26 @@ def branch_coverage(cfg, edges):
 
 
 def leaf_coverage(cfg, edges):
-    """Per leaf: how many papers it claims, and how many it claims alone."""
-    per_slot, per_paper = defaultdict(set), defaultdict(set)
+    """Per leaf: how many papers it claims, and how many no other leaf of the
+    SAME branch claims (only_here). also_other_branches is the cross-branch view."""
+    per_slot = defaultdict(set)
+    leaves_of = defaultdict(set)        # (branch, paper) -> leaves in that branch
+    branches_of = defaultdict(set)      # paper -> branches
     for edge in edges.values():
-        slot = (edge["branch"], edge.get("leaf") or "_branch")
-        per_slot[slot].add(edge["paper_key"])
-        per_paper[edge["paper_key"]].add(slot)
+        leaf = edge.get("leaf") or "_branch"
+        per_slot[(edge["branch"], leaf)].add(edge["paper_key"])
+        leaves_of[(edge["branch"], edge["paper_key"])].add(leaf)
+        branches_of[edge["paper_key"]].add(edge["branch"])
     rows = []
     for branch, leaves in active_branches(cfg)[0].items():
         for leaf, terms in leaves:
             keys = per_slot.get((branch, leaf), set())
-            alone = sum(1 for k in keys if len(per_paper[k]) == 1)
+            alone = sum(1 for k in keys if len(leaves_of[(branch, k)]) == 1)
             rows.append({"branch": branch, "leaf": leaf, "terms": len(terms),
                          "papers": len(keys), "only_here": alone,
-                         "also_elsewhere": len(keys) - alone})
+                         "also_other_leaves": len(keys) - alone,
+                         "also_other_branches": sum(1 for k in keys
+                                                    if len(branches_of[k]) > 1)})
     return pd.DataFrame(rows)
 
 
@@ -1443,6 +1570,7 @@ class RunStats:
         self.counters = {}
         self.verified = {"checked": 0, "repaired": 0}
         self.dedup = defaultdict(int)
+        self.unique_ids = set()
 
     def bump(self, name, n=1):
         self.counters[name] = self.counters.get(name, 0) + n
@@ -1477,7 +1605,9 @@ def linkify(ws):
             cell.style = "Hyperlink"
 
 
-def write_excel(cfg, papers, edges, runs):
+def write_excel(cfg, papers, edges, runs, extra=None, links=()):
+    """extra: more sheets {name: frame} (fill_fulltext adds its own), written
+    into the same workbook before it is swapped in."""
     df = pd.DataFrame(list(papers.values())) if papers else pd.DataFrame()
     df = clean_frame(df.reindex(columns=PAPER_COLUMNS).fillna(""))
     saved, not_saved = df[df["status"] == "ok"], df[df["status"] != "ok"]
@@ -1507,13 +1637,31 @@ def write_excel(cfg, papers, edges, runs):
             df[df["action"] == "needs_tmu"].groupby("publisher").size()
               .reset_index(name="papers").sort_values("papers", ascending=False))
     sheets["runs"] = pd.DataFrame(runs).reindex(columns=RUN_COLUMNS)
+    sheets.update(extra or {})
 
-    with pd.ExcelWriter(out, engine="openpyxl") as writer:
+    # written beside, then swapped in: Windows refuses to replace a workbook
+    # that is open in Excel
+    fresh = out.with_name(f"{out.stem}_{cfg['_run_id']}.xlsx")
+    with pd.ExcelWriter(fresh, engine="openpyxl") as writer:
         for name, frame in sheets.items():
             frame.to_excel(writer, sheet_name=name, index=False)
         for name in ("saved", "not_saved", "need_TMU", "need_request",
-                     "duplicates"):
+                     "duplicates", *links):
             linkify(writer.book[name])
+    try:
+        write_atomic(out, fresh.read_bytes(), wait=120)
+        fresh.unlink()
+    except SystemExit:
+        # still open after two minutes: keep this run's copy rather than lose it
+        print(f"!! {out.name} stayed open; this run's workbook is {fresh.name}. "
+              f"Close Excel - the next run replaces {out.name} and tidies this copy away")
+        return len(saved), len(not_saved), fresh
+    # copies left by earlier runs that found the workbook open
+    for old in out.parent.glob(f"{out.stem}_r*.xlsx"):
+        try:
+            old.unlink()
+        except OSError:
+            pass                      # that copy is open itself; next run
     return len(saved), len(not_saved), out
 
 
@@ -1539,16 +1687,22 @@ def write_report(cfg, stats, papers, edges, throttles, todo_branches, live):
     if not searches.empty:
         lines.append(searches.to_string(index=False))
         lines += ["-" * 74,
-                  f"matched in PubMed : {searches['matched'].sum():>8}",
+                  f"matched in PubMed : {searches['matched'].sum():>8}"
+                  "   (summed over queries: a paper whose epub and print years",
+                  "                              differ is counted in both years)",
                   f"ids retrieved     : {searches['retrieved'].sum():>8}",
+                  f"unique papers     : {len(stats.unique_ids):>8}"
+                  "   <- compare this one between runs",
                   f"open access       : {searches['open_access'].sum():>8}",
-                  f"new this run      : {searches['new'].sum():>8}",
+                  f"fetched this run  : {searches['new'].sum():>8}"
+                  "   (new papers + re-fetched old ones)",
                   f"skipped (settled) : {searches['skipped'].sum():>8}"]
     else:
         lines.append("(none)")
 
     lines += ["", "DOWNLOADS THIS RUN", "-" * 74]
     for name in ("metadata_saved", "fulltext_saved", "pdf_saved",
+                 "fulltext_cached", "pdf_cached",
                  "supplementary_saved", "fulltext_failed", "pdf_failed",
                  "supplementary_failed", "pmcid_recovered", "epmc_refused"):
         lines.append(f"{name:26} {stats.counters.get(name, 0):>8}")
@@ -1630,7 +1784,7 @@ def write_report(cfg, stats, papers, edges, throttles, todo_branches, live):
     lines += [f"  {w}" for w in stats.warnings] or ["  (none)"]
 
     text = "\n".join(lines) + "\n"
-    out = state_path(cfg, f"run_report_{cfg['_run_id']}.txt")
+    out = state_path(cfg, "history") / f"run_report_{cfg['_run_id']}.txt"
     write_atomic(out, text.encode("utf-8"))
     write_atomic(state_path(cfg, "run_report_latest.txt"), text.encode("utf-8"))
 
@@ -1694,7 +1848,7 @@ def main(config_path="config.yaml"):
     if kept or lost:
         print(f"migrated v5 tags: {kept} queries moved into queries.csv, "
               f"{lost} were cut at 300 chars and are left blank")
-    touched, saves = set(), SaveClock()
+    touched, saves, fetched = set(), SaveClock(), set()
     # a paper x branch x leaf carries "query" or "query_mesh", never both.
     # Earlier runs are in here too.
     query_tagged = {k[:3] for k in edges if k[4] in QUERY_METHODS}
@@ -1729,25 +1883,43 @@ def main(config_path="config.yaml"):
                 # every query that runs is registered, so queries.csv is the
                 # full search log, not only the queries that tagged something
                 qid = query_id(query)
-                ids, matched = search(cfg, ncbi, query, stats)
+                try:
+                    ids, matched = search(cfg, ncbi, query, stats)
+                except Exception as exc:
+                    # one query lost, not the whole run; the next run repeats it
+                    msg = (f"SEARCH FAILED {branch}/{leaf} {year_tag}: "
+                           f"{type(exc).__name__} {str(exc)[:80]} - rerun to fill it")
+                    stats.warnings.append(msg)
+                    tqdm.write("  !! " + msg)
+                    continue
                 oa_total = 0
                 if cfg["download"].get("measure_open_access") and ids:
-                    oa_total = count_only(ncbi, query + OA_FILTER)
+                    try:
+                        oa_total = count_only(ncbi, query + OA_FILTER)
+                    except Exception as exc:
+                        stats.warnings.append(f"open-access count failed {branch}/{leaf} "
+                                              f"{year_tag}: {type(exc).__name__}")
 
+                stats.unique_ids.update(ids)
                 todo_ids = []
                 for pmid in ids:
                     key = index.by_pmid.get(pmid)
                     entry = papers.get(key) if key else None
-                    if should_process(entry, cfg)[0]:
+                    # a paper fetched earlier in this run is not fetched again,
+                    # whatever its status: a failure would otherwise spend all
+                    # its attempts in one run, once per leaf or year it matches
+                    if pmid not in fetched and should_process(entry, cfg)[0]:
                         todo_ids.append(pmid)
-                    else:
+                    elif key:
                         # already on disk: no re-download, but this leaf still
                         # gets its own row. The keyword test runs on the stored
                         # metadata.json; without one it is filed as "query".
-                        old = stored_row(cfg, entry) if leaf_mesh else None
-                        by_keyword = not old or keyword_hit(old, terms)
+                        old = stored_row(cfg, entry) if (leaf_mesh or mesh_table) else None
+                        by_keyword = not leaf_mesh or not old or keyword_hit(old, terms)
                         tag_query(key, branch, leaf,
                                   "query" if by_keyword else "query_mesh", query)
+                        for m_branch, m_leaf in slots_from_mesh(mesh_table, old or {}):
+                            tag(key, m_branch, m_leaf, "mesh")
 
                 stats.searches.append(
                     {"branch": branch, "leaf": leaf, "year": year_tag,
@@ -1763,13 +1935,35 @@ def main(config_path="config.yaml"):
                 for i in range(0, len(todo_ids), size):
                     chunk = todo_ids[i:i + size]
                     batch_tag = f"{branch}_{leaf}_{year_tag}_{i // size:03d}"
-                    batch = fetch_batch(cfg, ncbi, chunk, batch_tag)
+                    try:
+                        batch = fetch_batch(cfg, ncbi, chunk, batch_tag)
+                    except Exception as exc:
+                        # not marked fetched: a later leaf or year may try again
+                        msg = (f"EFETCH FAILED {len(chunk)} paper(s) in {batch_tag}: "
+                               f"{type(exc).__name__} {str(exc)[:80]} - rerun to fill them")
+                        stats.warnings.append(msg)
+                        tqdm.write("  !! " + msg)
+                        bar.update(len(chunk))
+                        continue
+                    fetched.update(chunk)
                     stats.bump("pmcid_recovered",
                                fill_pmcids(ncbi, [r for r, err in batch if not err]))
                     for row, parse_err in batch:
                         if parse_err:
-                            update_paper(cfg, papers, index, row,
-                                         "parse_error", parse_err)
+                            known = index.by_pmid.get(str(row["pmid"]))
+                            if known and papers[known].get("status") != "parse_error":
+                                # a good earlier record stays; a new pmid:X row
+                                # would only duplicate it
+                                stats.warnings.append(
+                                    f"re-parse failed, earlier record kept: "
+                                    f"{known} ({parse_err[:80]})")
+                            else:
+                                row["key"] = known or row["key"]
+                                update_paper(cfg, papers, index, row,
+                                             "parse_error", parse_err)
+                            # the query did find it, so this leaf keeps its tag;
+                            # without a parsed record the keyword test cannot run
+                            tag_query(known or row["key"], branch, leaf, "query", query)
                             bar.update(1)
                             continue
 
@@ -1777,15 +1971,16 @@ def main(config_path="config.yaml"):
                         stats.dedup[method] += 1
                         if existing:
                             row["key"] = existing
+                            row["paper_folder"] = (papers.get(existing, {})
+                                                   .get("paper_folder", ""))
 
                         folder = paper_dir(cfg, row)
-                        write_atomic(folder / "metadata.json",
-                                     json.dumps(row, ensure_ascii=False,
-                                                indent=2).encode("utf-8"))
+                        meta = dict(row)
                         row["paper_folder"] = rel(cfg, folder)
                         row["metadata_path"] = rel(cfg, folder / "metadata.json")
-                        stats.bump("metadata_saved")
                         touched.add(row["key"])
+                        had = ((folder / "fulltext.xml").exists(),
+                               (folder / "fulltext.pdf").exists())
 
                         status, detail, src, extra = "metadata_only", "", "", {}
                         if cfg["download"].get("fulltext"):
@@ -1806,17 +2001,22 @@ def main(config_path="config.yaml"):
                                     # xml or pdf, either one is the paper
                                     status, src = "ok", "Europe PMC (PMC)"
                                     detail = f"pdf only, {int(nbytes) // 1024} KB"
-                            stats.bump("pdf_saved" if row.get("pdf_path")
-                                       else "pdf_failed")
-                        if cfg["download"].get("fulltext") or row.get("pdf_path"):
-                            stats.bump("fulltext_saved" if status == "ok"
-                                       else "fulltext_failed")
+                        # files that were already there are "cached", not saved
+                        has = ((folder / "fulltext.xml").exists(),
+                               (folder / "fulltext.pdf").exists())
+                        new = [h and not before for h, before in zip(has, had)]
+                        if cfg["download"].get("pdf"):
+                            stats.bump("pdf_saved" if new[1] else
+                                       "pdf_cached" if has[1] else "pdf_failed")
+                        if cfg["download"].get("fulltext") or has[1]:
+                            stats.bump("fulltext_failed" if status != "ok" else
+                                       "fulltext_saved" if any(new) else "fulltext_cached")
 
                         row["source_fulltext"] = src
                         # in PMC is not the same thing as retrievable, and a
                         # TDM copy is a subscription copy, not an open one
                         row["is_open_access"] = ("yes" if status == "ok"
-                                                 and "TDM" not in src else "no")
+                                                 and not is_closed_source(src) else "no")
                         row["source_chain"] = source_chain(row, src)
 
                         if status == "ok" and cfg["download"].get("supplementary"):
@@ -1828,6 +2028,8 @@ def main(config_path="config.yaml"):
 
                         entry = update_paper(cfg, papers, index, row, status,
                                              detail, method)
+                        write_metadata(cfg, entry, meta)
+                        stats.bump("metadata_saved")
                         # "query_mesh" = the query found it, but no keyword is
                         # in the title or abstract, so MeSH is what caught it
                         by_keyword = not leaf_mesh or keyword_hit(row, terms)
@@ -1912,17 +2114,22 @@ def test_api(config_path):
     counts, claimed_by = {}, []
     try:
         for leaf, terms in leaves:
-            year_tag, query = next(iter(query_plan(
-                cfg, terms, query_mesh(cfg, branch, leaf))))
-            counts[leaf] = count_only(ncbi, query)
+            # ask in the span that holds 2013, not the first year (1990 in the real run)
+            plan = list(query_plan(cfg, terms, query_mesh(cfg, branch, leaf)))
+            year_tag, query = next(
+                ((t, q) for t, q in plan
+                 if int(t.split("-")[0]) <= 2013 <= int(t.split("-")[-1])), plan[0])
+            result = esearch(ncbi, term=query, retmax=0)
+            counts[leaf] = _int(result.get("Count"), 0)
             hit = count_only(ncbi, f"{BECKMAN_PMID}[uid] AND ({query})")
             if hit:
                 claimed_by.append((leaf, query))
             print(f"    {leaf:22} {counts[leaf]:>6} match in {year_tag}"
                   f"   beckman: {'YES' if hit else '-'}")
+            for msg in query_warnings(result):
+                print(f"      !! PubMed ignored part of the query - {msg}")
         record("esearch", any(counts.values()),
-               f"{len(counts)} leaves, {sum(counts.values())} matches in the "
-               f"first year")
+               f"{len(counts)} leaves, {sum(counts.values())} matches in {year_tag}")
     except Exception as exc:
         record("esearch", False, f"{type(exc).__name__}: {str(exc)[:70]}")
 
@@ -1975,8 +2182,11 @@ def test_api(config_path):
                    f"{len(resp.content)} bytes")
         except requests.exceptions.RequestException as exc:
             record("Europe PMC pdf", False, type(exc).__name__)
+    elif row:
+        # the paper is not in PMC: that says nothing about the API
+        print(f"  [skip] Europe PMC               PMID {BECKMAN_PMID} has no PMCID")
     else:
-        record("Europe PMC", False, "no pmcid to test with")
+        record("Europe PMC", False, "efetch failed, no record to test with")
 
     if cfg["download"].get("try_open_access", True):
         try:
@@ -1986,6 +2196,49 @@ def test_api(config_path):
             record("Unpaywall", resp.status_code == 200, f"HTTP {resp.status_code}")
         except requests.exceptions.RequestException as exc:
             record("Unpaywall", False, type(exc).__name__)
+
+    if row and row.get("pmcid"):
+        try:
+            resp = requests.get(PMC_S3 + "/", timeout=30, headers=HEADERS,
+                                params={"list-type": "2", "delimiter": "/",
+                                        "prefix": f"metadata/{row['pmcid']}."})
+            found = re.findall(r"<Key>(metadata/[^<]+\.json)</Key>", resp.text)
+            record("PMC Cloud (AWS)", resp.status_code == 200 and bool(found),
+                   f"HTTP {resp.status_code}, {len(found)} metadata object(s)")
+        except requests.exceptions.RequestException as exc:
+            record("PMC Cloud (AWS)", False, type(exc).__name__)
+
+    pub = cfg.get("publisher_api") or {}
+    els_key = pub.get("elsevier") or os.environ.get("ELSEVIER_API_KEY")
+    if els_key:
+        headers = {"X-ELS-APIKey": els_key, "Accept": "text/xml"}
+        token = pub.get("elsevier_insttoken") or os.environ.get("ELSEVIER_INSTTOKEN")
+        if token:
+            headers["X-ELS-Insttoken"] = token
+        try:
+            resp = requests.get(ELSEVIER.format(doi="10.1016/j.ophtha.2012.10.036"),
+                                headers={**HEADERS, **headers}, params={"view": "FULL"},
+                                timeout=60)
+            paras = resp.content.count(b"<ce:para")
+            record("Elsevier TDM (xml)", resp.status_code == 200 and paras >= 5,
+                   f"HTTP {resp.status_code}, ce:para={paras}"
+                   + ("" if paras >= 5 else " (key ok but not entitled, or no full body)"))
+        except requests.exceptions.RequestException as exc:
+            record("Elsevier TDM (xml)", False, type(exc).__name__)
+    else:
+        print("  [skip] Elsevier TDM            no publisher_api.elsevier / ELSEVIER_API_KEY")
+    wiley_key = pub.get("wiley") or os.environ.get("WILEY_TDM_TOKEN")
+    if wiley_key:
+        try:
+            resp = requests.get(WILEY.format(doi="10.1111%2Fdme.12089"),
+                                headers={**HEADERS, "Wiley-TDM-Client-Token": wiley_key,
+                                         "Accept": "application/pdf"}, timeout=60)
+            record("Wiley TDM (pdf)", resp.status_code == 200 and resp.content.startswith(b"%PDF"),
+                   f"HTTP {resp.status_code}, {len(resp.content)} bytes")
+        except requests.exceptions.RequestException as exc:
+            record("Wiley TDM (pdf)", False, type(exc).__name__)
+    else:
+        print("  [skip] Wiley TDM               no publisher_api.wiley / WILEY_TDM_TOKEN")
 
     bad = [n for n, ok, _ in results if not ok]
     print("-" * 74)
@@ -1998,6 +2251,10 @@ def test_api(config_path):
         print("  Europe PMC failed  -> that paper is in PMC but not open access")
         print("  Unpaywall failed   -> only the open-copy fallback is affected;")
         print("                        the run still works without it")
+        print("  PMC Cloud failed   -> that paper is not in the open datasets (closed,")
+        print("                        embargoed) or AWS is blocked; the run still works")
+        print("  Elsevier failed    -> wrong key, not on the TMU network/VPN, or no entitlement")
+        print("  Wiley failed       -> wrong token, or not on the TMU network/VPN")
 
 
 def check_only(config_path):
@@ -2059,6 +2316,12 @@ def check_only(config_path):
 
 if __name__ == "__main__":
     args = [a for a in sys.argv[1:] if not a.startswith("-")]
+    flags = [a for a in sys.argv[1:] if a.startswith("-")]
+    # a typo like --chek must not start a full crawl
+    unknown = [f for f in flags if f not in ("--test-api", "--check")]
+    if unknown or len(args) > 1:
+        sys.exit(f"unknown argument(s): {' '.join(unknown + args[1:])}\n"
+                 "usage: python pubmed_crawler_v6_1.py [config.yaml] [--check | --test-api]")
     path = args[0] if args else "config.yaml"
     if "--test-api" in sys.argv:
         test_api(path)
