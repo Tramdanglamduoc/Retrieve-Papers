@@ -1,0 +1,95 @@
+# Example config - a smoke test on one branch, two leaves, one year (2013).
+# Copy it to config.yaml, put your email in, and run:
+#   python pubmed_crawler_v6_1.py config.yaml --check      # prints the queries, no network
+#   python pubmed_crawler_v6_1.py config.yaml --test-api   # do the APIs answer?
+#   python pubmed_crawler_v6_1.py config.yaml              # the real run
+#
+# KEYS: keep them out of this file. Set environment variables instead
+# (Windows: setx NCBI_API_KEY "..." then open a new terminal;
+#  macOS/Linux: export NCBI_API_KEY="..." in your shell profile):
+#   NCBI_API_KEY  ELSEVIER_API_KEY  ELSEVIER_INSTTOKEN  WILEY_TDM_TOKEN
+# Never commit a config.yaml that holds a real key.
+#
+# KNOWN ANSWER: the 2013 window contains Ferris et al. 2013, "Clinical
+# classification of age-related macular degeneration" (PMID 23332590).
+# --test-api checks that the query finds it. If it does not, read the
+# CAPPED and "PUBMED IGNORED" warnings before blaming the query.
+
+contact:
+  email: you@example.com   # required - NCBI rejects anonymous use
+  ncbi_api_key: null       # or env NCBI_API_KEY. null = 3 req/s, with a key 10 req/s
+
+# Used by fill_fulltext.py. Elsevier / Wiley full text only works from a network
+# your institution has a licence for (campus or VPN).
+publisher_api:
+  elsevier: null            # or env ELSEVIER_API_KEY (Elsevier Developer Portal)
+  elsevier_insttoken: null  # or env ELSEVIER_INSTTOKEN - only if your library gave you one
+  wiley: null               # or env WILEY_TDM_TOKEN (Wiley TDM click-through token)
+
+source:
+  database: PubMed
+
+paths:
+  output: ./output_smoke
+  sync_to: null             # optional second copy, e.g. a shared drive
+
+date_range:
+  from: 2013
+  to: 2013
+  split_by_year: true
+
+search:
+  include_mesh: true        # MeSH goes INTO the query, not only into tagging
+
+limits:
+  max_per_query: null       # null = take every match, paging as needed
+  batch_size: 50
+  max_attempts: 3
+  ncbi_per_second: 3
+  epmc_per_second: 2
+  # unpaywall_locations: 4  # fill_fulltext.py: Unpaywall pdf addresses tried per paper
+  # retry_after_days: 7     # fill_fulltext.py: leave alone papers tried in the last 7 days
+
+download:
+  fulltext: true
+  pdf: true
+  supplementary: false
+  verify_cached: true
+  measure_open_access: true
+  mesh_autotag: true
+
+# example
+disease:
+  name: #keyword
+  anchor:
+    - #keyword synonym
+    - #keyword category
+    - #keyword subcategory
+  mesh:
+    - #keyword mesh
+
+branches:
+  "0.1_identity":
+    leaves:
+      generic:
+        terms:
+          # definition & criteria
+          - #
+          # naming & terminology
+          - #
+          # classification
+          - #
+          # grading / staging
+          - #
+        mesh:
+          - #
+          # the query explodes the line above; the autotagger does not,
+          # so the children are listed for tagging
+
+      named:
+        # named frameworks, keyword only (no mesh), so the count is a clean measure
+        terms:
+          - #
+
+  # A branch with no terms is listed as TODO and skipped:
+  # "1.1_stage": {}
