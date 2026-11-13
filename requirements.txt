@@ -1,0 +1,7 @@
+biopython
+pandas
+openpyxl
+requests
+pyyaml
+tqdm
+pypdf[crypto]
