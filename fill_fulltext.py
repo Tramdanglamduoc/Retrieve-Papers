@@ -7,7 +7,8 @@ on disk.
 
 Routes, in order, for whatever a paper is still missing:
     1. _inbox/           files you downloaded by hand (browser, EndNote)
-    2. PMC               Europe PMC xml, NCBI xml, Europe PMC pdf
+    2. PMC               Europe PMC xml, NCBI xml, PMC Cloud Service (AWS open
+                         data: xml + pdf, no login), Europe PMC pdf (last resort)
     3. Unpaywall         every open pdf location, not only the first
     4. publisher TDM     Elsevier xml + pdf, Wiley pdf (needs publisher_api keys
                          in the yaml and the TMU network)
@@ -15,6 +16,9 @@ Routes, in order, for whatever a paper is still missing:
                          advertises. Works where the campus IP is enough
                          (Springer, BMJ ...). A site that asks "are you a
                          human" is left to a human: see --open.
+    6. repository        the free-copy pages Unpaywall lists (university
+                         repositories) and the full-text links the publisher
+                         registered with Crossref
 
 Files land in the folder that already holds the paper's metadata.json.
 
@@ -24,23 +28,31 @@ that really need TMU.
 
 _inbox naming: <pmid>.pdf, PMC<id>.pdf, or the DOI with "/" as "_"
 (10.1167_iovs.13-12931.pdf). With pypdf installed, a pdf with any other name
-is matched by the DOI printed inside it.
+is matched by the DOI in its metadata, or by a DOI printed before its
+reference list together with the paper's title.
 
     python fill_fulltext.py config.yaml
     python fill_fulltext.py config.yaml --inbox-only     # no network
     python fill_fulltext.py config.yaml --skip-saved     # only unsaved papers
     python fill_fulltext.py config.yaml --limit 20       # a trial run
+    python fill_fulltext.py config.yaml --retry-after-days 14   # leave alone the
+        papers any run already tried in the last 14 days (--force ignores it)
     python fill_fulltext.py config.yaml --open 10        # the by-hand loop:
         opens the next 10 unsaved papers in YOUR browser. You pass the human
         check and save each pdf into <output>/_inbox/ (any file name), then
     python fill_fulltext.py config.yaml --inbox-only     # files them
+        A 1-page pdf is held back (Elsevier answers page one only when the
+        network is not entitled); --allow-short-pdf files it anyway.
+        A 1-page pdf an older crawler saved from the Elsevier API is removed
+        and the paper is tried again.
 
 Every run OVERWRITES the live files - there is one of each, always current:
     _state/papers.csv, paper_branches.csv, queries.csv, runs.csv (+1 row),
     _state/run_report_latest.txt, _state/fulltext_fill_log.csv (+rows),
     _index/eye_disease_papers.xlsx, _index/branches/..., metadata.json
 Kept out of the way, never needed for daily reading:
-    _state/previous/    the four ledger csv as they were before the last run
+    _state/previous/    the four ledger csv and the fill log, as they were
+                        before the last run
     _state/history/     one dated report per run
 
 Keep this file beside the crawler; it imports it.
@@ -49,13 +61,17 @@ Keep this file beside the crawler; it imports it.
 import argparse
 import importlib
 import importlib.util
+import hashlib
+import inspect
 import json
+import os
 import re
 import shutil
 import time
+import unicodedata
 import webbrowser
 from collections import Counter, defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -84,6 +100,19 @@ LOG_COLUMNS = ["run_id", "paper_key", "pmid", "doi", "route", "result", "detail"
 # hammered for every remaining paper
 BREAKER = 5
 RETRY_STATUS = {429, 500, 502, 503, 504}
+OPEN_STATUSES = {"gold", "green", "hybrid", "bronze", "diamond"}   # Unpaywall oa_status
+# once a route's breaker has tripped, it is still probed on every Nth paper
+PROBE_EVERY = 20
+# log results that are not a real attempt, so they do not start a cooldown
+NOT_TRIED = {"skipped", "removed", "locations not tried", "no answer"}
+PMC_S3 = "https://pmc-oa-opendata.s3.amazonaws.com"   # PMC Cloud Service, no login
+CROSSREF = "https://api.crossref.org/works/{doi}"
+# hosts the repository route must not visit: PMC has its own routes, doi.org is
+# what publisher_site already opened, the TDM hosts need their keys
+SKIP_LANDING = ("ncbi.nlm.nih.gov", "europepmc.org", "doi.org", "api.elsevier.com",
+                "api.wiley.com")
+MAX_LOG_ROWS_IN_EXCEL = 20000    # the csv keeps everything; the sheet gets the last rows
+ROTATE_LOG_ROWS = 100000         # then the csv moves to _state/history/ and restarts
 # the plain "?pdf=render" page answers 403 to scripts; these are the endpoints
 # behind it, tried in order
 PMC_PDF = ("https://europepmc.org/backend/ptpmcrender.fcgi?accid={pmcid}&blobtype=pdf",
@@ -105,8 +134,54 @@ def load_crawler(name):
     raise SystemExit(f"crawler not found beside this file: {', '.join(names)}")
 
 
+# characters that would continue a DOI; "." is left out on purpose, a DOI is
+# often printed at the end of a sentence
+DOI_END = r"(?![0-9a-z\-_/(])"
+
+
 def squash(text):
     return re.sub(r"[^a-z0-9]", "", str(text).lower())
+
+
+def doi_in_text(text, dois):
+    """Key of the ledger DOI printed first in the text. A DOI only counts when
+    it ends there: 10.1038/eye.2013.1 must not match inside eye.2013.10, nor
+    .../bjo.2005.084 inside .../bjo.2005.084-1."""
+    hits = [(m.start(), key) for doi, key in dois.items()
+            if doi in text and (m := re.search(re.escape(doi) + DOI_END, text))]
+    return min(hits)[1] if hits else None
+
+
+REFERENCES = re.compile(r"\b(references|bibliography|literature cited)\b")
+PMID_NAME = re.compile(r"(?i)^(?:pmid)?[\s_-]*(\d{5,9})$")
+
+
+def title_head(title):
+    """The first 50 letters/digits of a title; shorter than 25 is too common
+    to identify a paper."""
+    head = squash(title)[:50]
+    return head if len(head) >= 25 else ""
+
+
+def doi_in_pdf(meta, body, dois, titles):
+    """(key, how). The pdf's own metadata is trusted. A DOI in the text counts
+    when the paper's own title is printed before any "references": a pdf that
+    merely cites a ledger paper has that title only in its reference list.
+    Many pdfs print no DOI at all (IOVS, JAMA of 2013) or carry another
+    edition's DOI, so the title alone is the last test - if it fits one paper."""
+    key = doi_in_text(meta, dois)
+    if key:
+        return key, "doi in pdf metadata"
+    front = squash(REFERENCES.split(body, maxsplit=1)[0])
+    key = doi_in_text(body, dois)
+    head = title_head(titles.get(key, "")) if key else ""
+    if head and head in front:
+        return key, "doi + title printed inside the pdf"
+    text = squash(meta) + front
+    hits = {k for k, t in titles.items() if (h := title_head(t)) and h in text}
+    if len(hits) == 1:
+        return hits.pop(), "title printed inside the pdf"
+    return None, "no match" if not hits else f"title fits {len(hits)} papers"
 
 
 def now():
@@ -120,7 +195,14 @@ class Fill:
         self.ncbi = c.Throttle(cfg["limits"]["ncbi_per_second"])
         self.web = c.Throttle(cfg["limits"]["epmc_per_second"])
         self.site = c.Throttle(1)            # publisher sites: one request a second
-        self.keys = cfg.get("publisher_api") or {}
+        self.keys = dict(cfg.get("publisher_api") or {})
+        # a key may live in an environment variable instead of the yaml
+        for name, env in (("elsevier", "ELSEVIER_API_KEY"),
+                          ("elsevier_insttoken", "ELSEVIER_INSTTOKEN"),
+                          ("wiley", "WILEY_TDM_TOKEN")):
+            if not self.keys.get(name) and os.environ.get(env):
+                self.keys[name] = os.environ[env]
+        self.pmc_s3 = getattr(c, "PMC_S3", PMC_S3)
         self.started = now()
         self.log, self.routes = [], Counter()
         self.count = Counter()
@@ -130,6 +212,12 @@ class Fill:
         self.refused_run = Counter()      # consecutive refusals per route key
         self.tries = max(1, int(cfg["limits"].get("max_attempts", 3) or 3))
         self.unpaywall_tries = max(1, int(cfg["limits"].get("unpaywall_locations", 4) or 4))
+        self.landing_tries = max(0, int(cfg["limits"].get("landing_pages", 2) or 0))
+        self.crossref_tries = max(0, int(cfg["limits"].get("crossref_links", 2) or 0))
+        self.landings = []                # free-copy pages of the paper in hand
+        self.seen_urls = set()            # pdf urls already tried for it
+        self.in_cloud = None              # does the PMC open dataset hold it?
+        self.transient = False            # was the last try_pdf failure server trouble?
 
     # ------------------------------------------------------------ plumbing
 
@@ -190,17 +278,24 @@ class Fill:
         return False
 
     def try_pdf(self, entry, route, url, pdf, headers=None):
+        """True when saved. self.transient says whether a failure was the
+        server's trouble (no answer, 429, 5xx) rather than a real refusal."""
+        self.seen_urls.add(url)
+        self.transient = False
         try:
             resp = self.get(url, headers)
         except requests.exceptions.RequestException as exc:
+            self.transient = True
             self.note(entry, route, "no answer", f"{type(exc).__name__} {url}")
             return False
+        self.transient = resp.status_code in RETRY_STATUS
         facts = dict(self.last)
         if resp.status_code == 200 and resp.content.startswith(b"%PDF"):
             if "warning" in resp.headers.get("X-ELS-Status", "").lower():
                 # Elsevier answers 200 with page one only when the network
                 # is not entitled; that is not the paper
-                self.note(entry, route, "not entitled", "first page only", **facts)
+                status = resp.headers.get("X-ELS-Status", "")[:160]
+                self.note(entry, route, "not entitled", f"first page only | {status}", **facts)
                 return False
             if self.save(pdf, resp.content):
                 self.note(entry, route, "saved pdf", url, **facts)
@@ -220,6 +315,7 @@ class Fill:
         inbox = self.root / "_inbox"
         inbox.mkdir(parents=True, exist_ok=True)
         by_doi, by_pmid, by_pmcid, by_tail, plain = {}, {}, {}, {}, {}
+        titles = {key: e.get("title", "") for key, e in papers.items()}
         for key, e in papers.items():
             if e.get("doi"):
                 doi = self.c.normalize_doi(e["doi"])
@@ -235,8 +331,8 @@ class Fill:
                 by_pmcid[e["pmcid"].upper()] = key
 
         def match(path):
-            stem = path.stem
-            name = squash(re.sub(r"\s*\(\d+\)$", "", stem))     # "x (1).pdf"
+            stem = re.sub(r"\s*\(\d+\)$", "", path.stem)        # "x (1).pdf"
+            name = squash(stem)
             if name in by_doi:
                 return by_doi[name]
             if by_tail.get(name):
@@ -244,16 +340,12 @@ class Fill:
             for pmc in re.findall(r"PMC\d+", stem.upper()):
                 if pmc in by_pmcid:
                     return by_pmcid[pmc]
-            for digits in re.findall(r"\d{5,9}", stem):
-                if digits in by_pmid:
-                    return by_pmid[digits]
+            # only a name that IS the PMID: "nihms-2017454" is not PMID 2017454
+            m = PMID_NAME.match(stem)
+            if m and m.group(1) in by_pmid:
+                return by_pmid[m.group(1)]
             if path.suffix.lower() == ".pdf":
-                # the paper's own DOI is printed before any DOI it cites
-                text = pdf_text(path)
-                hits = [(text.find(doi), key) for doi, key in plain.items()
-                        if doi in text]
-                if hits:
-                    return min(hits)[1]
+                return doi_in_pdf(*pdf_text(path), plain, titles)[0]
             return None
 
         found = defaultdict(list)
@@ -277,6 +369,11 @@ class Fill:
                 self.note(entry, "inbox", "rejected", f"{path.name}: {why}")
             elif target.exists():
                 self.inbox_left.append(f"{path.name} - {target.name} already saved")
+            elif (target.suffix == ".pdf" and pdf_pages(path) == 1
+                  and not getattr(self.args, "allow_short_pdf", False)):
+                self.inbox_left.append(f"{path.name} - only 1 page, held back (first page "
+                                       "only?). Open it; if complete, rerun with --allow-short-pdf")
+                self.note(entry, "inbox", "held", f"{path.name}: 1 page")
             else:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.move(str(path), str(target))
@@ -305,27 +402,102 @@ class Fill:
                   f"Europe PMC HTTP {resp.status_code}")
         return "", raw is None
 
+    def s3_url(self, url):
+        """s3://bucket/key?md5=... -> (https url, md5). Plain https passes through."""
+        m = re.match(r"s3://([^/]+)/([^?]+)(?:\?(.*))?$", url or "")
+        if m:
+            md5 = re.search(r"md5=([0-9a-fA-F]{32})", m.group(3) or "")
+            return (f"https://{m.group(1)}.s3.amazonaws.com/{m.group(2)}",
+                    md5.group(1).lower() if md5 else "")
+        md5 = re.search(r"md5=([0-9a-fA-F]{32})", url or "")
+        return re.sub(r"\?.*$", "", url or ""), (md5.group(1).lower() if md5 else "")
+
+    def pmc_cloud(self, entry, xml, pdf):
+        """PMC Cloud Service: the sanctioned bulk route (open data on AWS, no
+        login). metadata/PMC<id>.<version>.json names the xml and pdf of each
+        article version; the version cannot be guessed, so list first. Fills only
+        what is missing. Returns the list of what it saved: "xml", "pdf"."""
+        route, pmcid, got = "PMC Cloud", entry["pmcid"].upper(), []
+        self.in_cloud = None          # unknown until the listing answers
+        try:
+            lst = self.get(f"{self.pmc_s3}/", params={"list-type": "2", "delimiter": "/",
+                                                    "prefix": f"metadata/{pmcid}."})
+        except requests.exceptions.RequestException as exc:
+            self.note(entry, route, "no answer", type(exc).__name__)
+            return got
+        if lst.status_code != 200:
+            self.note(entry, route, "refused", f"list HTTP {lst.status_code}", **self.last)
+            return got
+        keys = re.findall(r"<Key>(metadata/%s\.(\d+)\.json)</Key>" % re.escape(pmcid), lst.text)
+        self.in_cloud = bool(keys)
+        if not keys:
+            self.note(entry, route, "not in cloud",
+                      "no metadata object: not in the open datasets, or embargoed", **self.last)
+            return got
+        for key, _version in sorted(keys, key=lambda k: -int(k[1])):
+            if (xml.exists() or "xml" in got) and (pdf.exists() or "pdf" in got):
+                break
+            try:
+                meta = self.get(f"{self.pmc_s3}/{key}").json()
+            except (requests.exceptions.RequestException, ValueError) as exc:
+                self.note(entry, route, "no answer", f"{key}: {type(exc).__name__}")
+                continue
+            tag = (f"{key.split('/')[-1]} manuscript={meta.get('is_manuscript')} "
+                   f"license={meta.get('license_code')}")
+            for kind, target, field in (("pdf", pdf, "pdf_url"), ("xml", xml, "xml_url")):
+                if target.exists() or kind in got:
+                    continue
+                if not meta.get(field):
+                    if kind == "pdf":
+                        self.note(entry, route, "no pdf in cloud", tag)
+                    continue
+                url, md5 = self.s3_url(meta[field])
+                try:
+                    resp = self.get(url)
+                except requests.exceptions.RequestException as exc:
+                    self.note(entry, route, "no answer", f"{kind} {type(exc).__name__} {url}")
+                    continue
+                facts = dict(self.last)
+                if resp.status_code != 200:
+                    self.note(entry, route, "refused", f"{kind} HTTP {resp.status_code} {url}", **facts)
+                elif md5 and hashlib.md5(resp.content).hexdigest() != md5:
+                    self.note(entry, route, "md5 mismatch", f"{kind} {url}", **facts)
+                elif self.save(target, resp.content):
+                    self.note(entry, route, f"saved {kind}", f"{tag} {url}", **facts)
+                    got.append(kind)
+                else:
+                    self.note(entry, route, "invalid_file",
+                              f"{kind} failed validate_file {url}", **facts)
+        return got
+
     def pmc_pdf(self, entry, pdf):
+        """A refusal for a paper the PMC open datasets do not hold is the paper
+        being closed, not the endpoint being broken, so only server trouble and
+        refusals of open papers count toward the breaker. A tripped endpoint is
+        still probed every PROBE_EVERY papers."""
         for url in PMC_PDF:
             key = "pmc_pdf:" + url.split("?")[0]
-            if self.refused_run[key] >= BREAKER:
+            n = self.refused_run[key]
+            if n >= BREAKER and (n - BREAKER) % PROBE_EVERY:
+                self.refused_run[key] += 1
                 self.note(entry, "Europe PMC pdf", "skipped",
-                          f"{self.refused_run[key]} refusals in a row this run, not retried {url.split('?')[0]}")
+                          f"breaker open after {BREAKER} refusals, next probe in "
+                          f"{PROBE_EVERY - (n - BREAKER) % PROBE_EVERY} paper(s) {url.split('?')[0]}")
                 continue
             if self.try_pdf(entry, "Europe PMC pdf", url.format(pmcid=entry["pmcid"]), pdf):
                 self.refused_run[key] = 0
                 return True
-            self.refused_run[key] += 1
+            if n >= BREAKER or self.transient or self.in_cloud:
+                self.refused_run[key] += 1
         return False
 
-    def publisher_site(self, entry, doi, pdf):
+    def publisher_site(self, entry, doi, pdf, url=None, route="publisher site"):
         """The DOI's own page, read the way Google Scholar reads it: the
         citation_pdf_url tag. Entitlement is the network you are on. Returns
         "" when saved, otherwise why not."""
-        route = "publisher site"
         try:
             self.site.wait()
-            page = self.get(f"https://doi.org/{doi}", {"Accept": "text/html"})
+            page = self.get(url or f"https://doi.org/{doi}", {"Accept": "text/html"})
         except requests.exceptions.RequestException as exc:
             self.note(entry, route, "no answer", type(exc).__name__)
             return "publisher site did not answer"
@@ -340,20 +512,61 @@ class Fill:
                    else f"{host} page names no pdf")
             self.note(entry, route, "refused", f"{why} {page.url}", **self.last)
             return why
-        url = requests.compat.urljoin(page.url, (found.group(1) or found.group(2))
-                                      .replace("&amp;", "&"))
+        pdf_url = requests.compat.urljoin(page.url, (found.group(1) or found.group(2))
+                                          .replace("&amp;", "&"))
         self.site.wait()
-        if self.try_pdf(entry, route, url, pdf, {"Referer": page.url}):
+        if self.try_pdf(entry, route, pdf_url, pdf, {"Referer": page.url}):
             return ""
         return f"{host} gave a page, not the pdf - no access from this network, or a human check"
 
+    def crossref_links(self, entry, doi):
+        """pdf links the publisher registered with Crossref for this DOI (its
+        text-mining service). A link does not promise access: each is tried once."""
+        try:
+            resp = self.get(CROSSREF.format(doi=requests.utils.quote(doi, safe="/")),
+                            params={"mailto": self.c.Entrez.email}, timeout=40)
+            links = resp.json().get("message", {}).get("link", []) if resp.status_code == 200 else []
+        except (requests.exceptions.RequestException, ValueError, AttributeError):
+            self.note(entry, "Crossref", "no answer")
+            return []
+        urls = []
+        for link in links:
+            url = link.get("URL", "")
+            host = url.split("/")[2] if "//" in url else ""
+            if ("pdf" in (link.get("content-type") or "").lower() and url not in urls
+                    and url not in self.seen_urls
+                    and not any(host.endswith(h) for h in SKIP_LANDING)):
+                urls.append(url)
+        if not urls:
+            self.note(entry, "Crossref", "no pdf link", f"{len(links)} link(s) registered")
+        return urls
+
+    def repository(self, entry, doi, pdf):
+        """Free copies the DOI page itself does not show: the repository pages
+        Unpaywall lists, then Crossref's full-text links. Returns the name of the
+        route that saved a pdf, else ''."""
+        tried = 0
+        for url in self.landings:
+            host = url.split("/")[2] if "//" in url else ""
+            if any(host.endswith(h) for h in SKIP_LANDING):
+                continue
+            if tried >= self.landing_tries:
+                break
+            tried += 1
+            if not self.publisher_site(entry, doi, pdf, url=url, route="repository"):
+                return "repository page"
+        if self.crossref_tries:
+            for url in self.crossref_links(entry, doi)[:self.crossref_tries]:
+                if self.try_pdf(entry, "Crossref link", url, pdf):
+                    return "Crossref full-text link"
+        return ""
+
     def unpaywall(self, entry, doi):
         """(pdf urls, a link a person can open, oa_status); None = no answer."""
-        self.web.wait()
+        self.landings = []
         try:
-            resp = requests.get(self.c.UNPAYWALL.format(doi=doi), timeout=40,
-                                headers=self.c.HEADERS,
-                                params={"email": self.c.Entrez.email})
+            resp = self.get(self.c.UNPAYWALL.format(doi=doi),
+                            params={"email": self.c.Entrez.email}, timeout=40)
             if resp.status_code == 404:
                 return [], "", "unknown to Unpaywall"
             data = resp.json() if resp.status_code == 200 else None
@@ -369,6 +582,13 @@ class Fill:
             for p in places if p.get("url_for_pdf")))
         human = next((p.get("url_for_landing_page") or p.get("url")
                       for p in places if p.get("url_for_landing_page") or p.get("url")), "")
+        if data.get("is_oa"):
+            # repository copies only: the publisher's own page is the DOI page,
+            # which publisher_site opens (or, for Elsevier, must not open)
+            self.landings = list(dict.fromkeys(
+                p.get("url_for_landing_page") or p.get("url") for p in places
+                if p.get("host_type") == "repository"
+                and (p.get("url_for_landing_page") or p.get("url"))))
         return pdfs, human if data.get("is_oa") else "", data.get("oa_status") or "closed"
 
     def elsevier(self, entry, doi, xml, pdf):
@@ -380,14 +600,17 @@ class Fill:
         if not xml.exists():
             try:
                 resp = self.get(url, {**auth, "Accept": "text/xml"}, {"view": "FULL"})
-                # an unentitled answer is the abstract wrapped in the same envelope
-                body = b"ce:sections" in resp.content or b"xocs:rawtext" in resp.content
+                # an unentitled answer is the abstract wrapped in the same envelope:
+                # a full text has a <ce:sections> body with real paragraphs
+                paras = resp.content.count(b"<ce:para")
+                body = b"<ce:sections" in resp.content and paras >= 5
                 if resp.status_code == 200 and body and self.save(xml, resp.content):
-                    self.note(entry, "Elsevier TDM", "saved xml")
+                    self.note(entry, "Elsevier TDM", "saved xml", f"ce:para={paras}", **self.last)
                     got.append("xml")
                 else:
                     self.note(entry, "Elsevier TDM", "not entitled",
-                              f"xml HTTP {resp.status_code}")
+                              f"xml HTTP {resp.status_code}, full body: {body}, ce:para={paras}",
+                              **self.last)
             except requests.exceptions.RequestException as exc:
                 self.note(entry, "Elsevier TDM", "no answer", type(exc).__name__)
         if not pdf.exists() and self.try_pdf(
@@ -401,12 +624,24 @@ class Fill:
         c = self.c
         folder = self.root / entry["paper_folder"]
         xml, pdf = folder / "fulltext.xml", folder / "fulltext.pdf"
+        # taken before anything is deleted, so a removed file counts as a change
+        had = (xml.exists(), pdf.exists())
         for path in (xml, pdf):
             if path.exists() and not c.validate_file(path)[0]:
                 path.unlink()
-        had = (xml.exists(), pdf.exists())
+        # older crawler runs saved Elsevier's off-campus answer: page one only
+        source = entry.get("source_fulltext") or ""
+        if (pdf.exists() and "Elsevier TDM" in source and "manual" not in source
+                and pdf_pages(pdf) == 1):
+            pdf.unlink()
+            entry["source_fulltext"] = " + ".join(
+                s for s in source.split(" + ") if "Elsevier TDM" not in s)
+            self.note(entry, "Elsevier TDM", "removed", "saved pdf had 1 page (first page only)")
+            self.count["short_pdf_removed"] += 1
+        kept = (xml.exists(), pdf.exists())
         was_ok = entry.get("status") == "ok"
         sources, open_link, oa_status, unanswered, site_why = [], "", "", False, ""
+        self.landings, self.seen_urls, self.in_cloud = [], set(), None
 
         if inbox_files and self.take_inbox(entry, inbox_files, xml, pdf):
             sources.append("manual download")
@@ -419,6 +654,9 @@ class Fill:
                 unanswered |= silent
                 if src:
                     sources.append(src)
+            if pmcid and (not xml.exists() or not pdf.exists()):
+                if self.pmc_cloud(entry, xml, pdf):
+                    sources.append("PMC Cloud (AWS)")
             if pmcid and not pdf.exists() and self.pmc_pdf(entry, pdf):
                 sources.append("Europe PMC (PMC)")
 
@@ -469,8 +707,13 @@ class Fill:
                     site_why = self.publisher_site(entry, doi, pdf)
                     if not site_why:
                         sources.append("publisher site (TMU network)")
+            if doi and not pdf.exists() and not self.args.no_publisher:
+                found = self.repository(entry, doi, pdf)
+                if found:
+                    sources.append(found)
 
         has = (xml.exists(), pdf.exists())
+        c.drop_missing_files(self.cfg, entry)    # no path may point at a deleted file
         before = (entry.get("status"), entry.get("action"), entry.get("detail"))
         if has[0]:
             entry.update({"fulltext_path": c.rel(self.cfg, xml),
@@ -479,17 +722,29 @@ class Fill:
         if has[1]:
             entry.update({"pdf_path": c.rel(self.cfg, pdf),
                           "pdf_bytes": str(pdf.stat().st_size)})
-        self.count["xml_new"] += has[0] and not had[0]
-        self.count["pdf_new"] += has[1] and not had[1]
+        if has[0]:
+            entry["fulltext_format"] = c.xml_format(xml)
+        else:
+            entry["fulltext_format"] = ""
+        self.count["xml_new"] += has[0] and not kept[0]
+        self.count["pdf_new"] += has[1] and not kept[1]
+        self.count["papers_new_file"] += ((has[0] and not kept[0])
+                                          or (has[1] and not kept[1]))
         for s in dict.fromkeys(sources):
             self.routes[s] += 1
 
         if any(has):
-            if has != had or not was_ok:
+            if has != had or sources or not was_ok:
                 old = [s for s in (entry.get("source_fulltext") or "").split(" + ")
                        if s and s != "cached"] if was_ok else []
                 merged = list(dict.fromkeys(old + sources)) or ["cached"]
-                closed = all("TDM" in s or "TMU" in s or "manual" in s for s in merged)
+                if oa_status in OPEN_STATUSES:
+                    closed = False
+                elif oa_status == "closed":
+                    closed = True
+                else:
+                    # the crawler's rule; v5 has no is_closed_source
+                    closed = all("TDM" in s or "TMU" in s or "manual" in s for s in merged)
                 entry.update({
                     "status": "ok", "action": "done",
                     "detail": " + ".join(n for n, on in zip(("xml", "pdf"), has) if on),
@@ -499,7 +754,11 @@ class Fill:
                     "is_open_access": "no" if closed else "yes", "attempts": "0"})
                 self.count["newly_saved"] += not was_ok
         elif unanswered or self.args.inbox_only:
-            pass          # nothing learned, so the ledger keeps what it said
+            # nothing learned, so the ledger keeps what it said - unless it
+            # said "saved" and the file is gone
+            if was_ok:
+                entry.update({"status": "corrupt_file", "action": "retry_auto",
+                              "detail": "saved file was missing, invalid or 1 page - run again"})
         elif open_link:
             entry.update({"status": "oa_blocked", "action": BLOCKED[0],
                           "detail": f"free ({oa_status}), site refuses scripts - open: {open_link}"})
@@ -514,7 +773,7 @@ class Fill:
                                     f"{site_why or 'publisher site not tried'} "
                                     "- by hand: --open, then _inbox/"})
 
-        if has != had or before != (entry["status"], entry["action"], entry["detail"]):
+        if has != had or sources or before != (entry["status"], entry["action"], entry["detail"]):
             stamp = now().strftime("%Y-%m-%d %H:%M")
             entry["last_run"], entry["last_attempt"] = self.cfg["_run_id"], stamp
             self.stamp_metadata(entry, has, stamp)
@@ -528,7 +787,9 @@ class Fill:
         except (OSError, ValueError):
             return
         data["fulltext"] = {"status": entry["status"], "action": entry["action"],
+                            "tier": "full_text" if any(has) else "abstract_only",
                             "xml": bool(has[0]), "pdf": bool(has[1]),
+                            "xml_format": entry.get("fulltext_format", ""),
                             "source": entry.get("source_fulltext", ""),
                             "detail": entry.get("detail", ""),
                             "updated": stamp, "run_id": self.cfg["_run_id"]}
@@ -539,39 +800,116 @@ class Fill:
                                              indent=2).encode("utf-8"))
 
 
-def pdf_text(path):
+def recently_tried(log_path, days):
+    """Paper keys that a run in the last `days` days really tried over the
+    network (the run id is its UTC start time). Opening a tab, filing _inbox,
+    a skipped route or a server that did not answer is not a try. Empty when
+    days is 0 or there is no log yet."""
+    seen = set()
+    if not days or not log_path.exists():
+        return seen
+    cutoff = now() - timedelta(days=days)
+    try:
+        df = pd.read_csv(log_path, dtype=str,
+                         usecols=["run_id", "paper_key", "route", "result"]).fillna("")
+    except (ValueError, OSError):
+        return seen
+    for run_id, key, route, result in zip(df["run_id"], df["paper_key"],
+                                          df["route"], df["result"]):
+        if route in ("browser", "inbox") or result in NOT_TRIED:
+            continue
+        try:
+            stamp = datetime.strptime(run_id, "r%Y%m%d_%H%M%S").replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+        if stamp >= cutoff:
+            seen.add(key)
+    return seen
+
+
+def rotate_log(c, cfg):
+    """A log past ROTATE_LOG_ROWS rows moves to _state/history/; a fresh one starts."""
+    path = c.state_path(cfg, "fulltext_fill_log.csv")
+    if not path.exists():
+        return ""
+    with path.open("rb") as fh:
+        rows = sum(1 for _ in fh) - 1
+    if rows < ROTATE_LOG_ROWS:
+        return ""
+    history = c.state_path(cfg, "history")
+    history.mkdir(parents=True, exist_ok=True)
+    target = history / f"fulltext_fill_log_{cfg['_run_id']}.csv"
+    shutil.move(str(path), str(target))
+    return str(target)
+
+
+def pdf_pages(path):
+    """Number of pages, or None when pypdf is missing or cannot read the file."""
     try:
         from pypdf import PdfReader
-    except ImportError:
-        return ""
-    try:
-        reader = PdfReader(str(path))
-        text = " ".join(str(v) for v in (reader.metadata or {}).values())
-        for page in reader.pages[:2]:
-            text += " " + (page.extract_text() or "")
+        return len(PdfReader(str(path)).pages)
     except Exception:
-        return ""
-    return text.lower()
+        return None
 
 
-def open_in_browser(c, cfg, papers, n):
+def clean_pdf_text(text):
+    text = unicodedata.normalize("NFKC", text).lower()      # the "ﬁ" ligature
+    # a DOI broken at a hyphen keeps the hyphen: 10.1167/iovs.13-\n12931
+    return re.sub(r"\s+", " ", re.sub(r"-\s*\n\s*", "-", text))
+
+
+def pdf_text(path):
+    """(metadata, first two pages), both cleaned; ("", "") when unreadable."""
+    try:
+        from pypdf import PdfReader
+        reader = PdfReader(str(path))
+        meta = " ".join(str(v) for v in (reader.metadata or {}).values())
+        body = "\n".join((p.extract_text() or "") for p in reader.pages[:2])
+    except Exception:
+        return "", ""
+    return clean_pdf_text(meta), clean_pdf_text(body)
+
+
+def open_in_browser(c, cfg, papers, n, args):
     """The by-hand loop. A person passes the human check; the script only
     opens the tabs and remembers which papers it has already shown."""
     log_path = c.state_path(cfg, "fulltext_fill_log.csv")
     log = (pd.read_csv(log_path, dtype=str).fillna("") if log_path.exists()
            else pd.DataFrame(columns=LOG_COLUMNS))
     shown = set(log[log["route"] == "browser"]["paper_key"])
+    # a pdf already downloaded but not yet filed must not be fetched twice
+    waiting = set(Fill(c, cfg, args).scan_inbox(papers))
     def lacks_pdf(e):
         # not saved at all, or saved as xml only: a pdf is still wanted
         folder = e.get("paper_folder")
         return e.get("status") != "ok" or not (
             folder and (cfg["_root"] / folder / "fulltext.pdf").is_file())
-    todo = [e for e in papers.values() if lacks_pdf(e)]
-    todo.sort(key=lambda e: e["key"] in shown)           # not yet shown first
+    todo = [e for e in papers.values() if lacks_pdf(e) and e["key"] not in waiting]
+    nothing = sum(e.get("status") != "ok" for e in todo)
+    # not yet shown first; among those, papers with nothing saved before
+    # papers that already have their xml
+    todo.sort(key=lambda e: (e["key"] in shown, e.get("status") == "ok"))
+    fresh = sum(e["key"] not in shown for e in todo)
+    if not todo:
+        print("DONE - every paper has a pdf")
+        return
+    if fresh == 0 and not args.again:
+        print(f"DONE - every paper without a pdf has been opened once.\n"
+              f"{len(todo)} still have no pdf ({nothing} nothing saved, "
+              f"{len(todo) - nothing} xml only): the script and a browser could not get them.\n"
+              f"They are listed in _index/eye_disease_papers.xlsx (sheets not_saved, "
+              f"need_TMU) - that is the list for the lab to request.\n"
+              f"To go through them once more anyway: add --again")
+        return
+    total = len(todo)
+    if not args.again:
+        todo = [e for e in todo if e["key"] not in shown]
     rows = []
     for e in todo[:n]:
         link = re.search(r"open: (\S+)", e.get("detail", ""))
-        url = link.group(1) if link else e.get("doi_url") or e.get("pubmed_url")
+        # a paper in PMC: its PMC page has the free pdf (author manuscripts too)
+        url = (link.group(1) if link else e.get("pmc_url") or e.get("doi_url")
+               or e.get("pubmed_url"))
         if not url:
             continue
         webbrowser.open_new_tab(url)
@@ -579,11 +917,18 @@ def open_in_browser(c, cfg, papers, n):
         rows.append({"run_id": cfg["_run_id"], "paper_key": e["key"],
                      "pmid": e.get("pmid", ""), "doi": e.get("doi", ""),
                      "route": "browser", "result": "opened", "detail": url})
-        print(f"  {e.get('pmid') or e['key']:>12}  {url}")
+        kind = "xml only, needs pdf" if e.get("status") == "ok" else "nothing saved"
+        again = "  (opened before)" if e["key"] in shown else ""
+        print(f"  {e.get('pmid') or e['key']:>12}  [{kind}]{again}  {url}")
     c.write_atomic(log_path, pd.concat([log, pd.DataFrame(rows, columns=LOG_COLUMNS)])
                    .to_csv(index=False).encode("utf-8"))
-    left = sum(1 for e in todo if e["key"] not in shown) - len(rows)
-    print(f"\nopened {len(rows)} | not saved {len(todo)} | never shown yet {max(left, 0)}")
+    left = max(fresh - len(rows), 0)
+    print(f"\nopened {len(rows)} | still without a pdf {total} "
+          f"({nothing} nothing saved, {total - nothing} xml only) "
+          f"| never opened yet {left}")
+    if waiting:
+        print(f"skipped {len(waiting)} paper(s) whose file is already waiting in _inbox "
+              "- run --inbox-only to file them")
     print(f"save each pdf into {cfg['_root'] / '_inbox'}  (any file name), then run")
     print("    python fill_fulltext.py <config> --inbox-only")
     if importlib.util.find_spec("pypdf") is None:
@@ -636,13 +981,18 @@ def refresh_flat_manifests(c, cfg, papers):
 
 
 def write_excel(c, cfg, log, papers, edges, runs):
-    _, _, out = c.write_excel(cfg, papers, edges, runs)
     df = pd.DataFrame(list(papers.values())).reindex(columns=c.PAPER_COLUMNS).fillna("")
-    blocked = df[df["action"] == BLOCKED[0]]
+    extra = {"free_but_blocked": c.clean_frame(df[df["action"] == BLOCKED[0]]),
+             "fill_log": c.clean_frame(log.tail(MAX_LOG_ROWS_IN_EXCEL))}
+    if "extra" in inspect.signature(c.write_excel).parameters:
+        # one workbook, written whole and swapped in: never two files
+        return c.write_excel(cfg, papers, edges, runs, extra=extra,
+                             links=("free_but_blocked",))[2]
+    _, _, out = c.write_excel(cfg, papers, edges, runs)      # older crawler
     with pd.ExcelWriter(out, engine="openpyxl", mode="a",
                         if_sheet_exists="replace") as writer:
-        blocked.to_excel(writer, sheet_name="free_but_blocked", index=False)
-        log.to_excel(writer, sheet_name="fill_log", index=False)
+        for name, frame in extra.items():
+            frame.to_excel(writer, sheet_name=name, index=False)
         c.linkify(writer.book["free_but_blocked"])
     return out
 
@@ -661,7 +1011,7 @@ def write_report(c, cfg, run, papers, tried, inbox_seen):
         "AMD knowledge-framework - full-text fill report", "=" * 74,
         f"run_id      {cfg['_run_id']}",
         f"crawler     {c.__name__}",
-        f"mode        {'inbox only, no network' if run.args.inbox_only else 'inbox + PMC + Unpaywall + publisher TDM'}",
+        f"mode        {'inbox only, no network' if run.args.inbox_only else 'inbox + PMC + PMC Cloud + Unpaywall + repository + publisher TDM'}",
         f"TDM keys    elsevier {'set' if run.keys.get('elsevier') else '-'}"
         f"   wiley {'set' if run.keys.get('wiley') else '-'}",
         f"started     {run.started:%Y-%m-%d %H:%M} UTC",
@@ -672,6 +1022,7 @@ def write_report(c, cfg, run, papers, tried, inbox_seen):
         f"{'moved to saved':34} {run.count['newly_saved']:>8}",
         f"{'new fulltext.xml':34} {run.count['xml_new']:>8}",
         f"{'new fulltext.pdf':34} {run.count['pdf_new']:>8}",
+        f"{'1-page Elsevier pdf removed':34} {run.count['short_pdf_removed']:>8}",
         "", "WHERE THE NEW FILES CAME FROM", "-" * 74,
     ]
     L += [f"{name:34} {n:>8}" for name, n in run.routes.most_common()] or ["(nothing new)"]
@@ -680,7 +1031,7 @@ def write_report(c, cfg, run, papers, tried, inbox_seen):
           f"{'papers':34} {len(papers):>8}",
           f"{'saved (xml or pdf)':34} {len(papers) - len(missing):>8}",
           f"{'  with both xml and pdf':34} {both:>8}",
-          f"{'not saved':34} {len(missing):>8}",
+          f"{'not saved (abstract only)':34} {len(missing):>8}",
         f"{'saved, xml only (pdf missing)':34} {xml_only:>8}",
         f"{'saved, pdf only (xml missing)':34} {pdf_only:>8}",
           "", "BY WHAT HAPPENS NEXT", "-" * 74]
@@ -719,8 +1070,11 @@ def write_report(c, cfg, run, papers, tried, inbox_seen):
            "finished": f"{finished:%Y-%m-%d %H:%M}", "database": "fulltext-fill",
            "config_hash": cfg["_config_hash"],
            "retrieved": len(tried), "new": run.count["newly_saved"],
-           "fulltext_saved": run.count["xml_new"], "pdf_saved": run.count["pdf_new"],
-           "failed": len(missing), "warnings": len(run.inbox_left)}
+           # same meaning as the crawler's column: papers that got any new file
+           "fulltext_saved": run.count["papers_new_file"], "pdf_saved": run.count["pdf_new"],
+           # same meaning as the crawler's column: tried this run, still not saved
+           "failed": sum(e.get("status") != "ok" for e in tried),
+           "warnings": len(run.inbox_left)}
     return text, out, row
 
 
@@ -736,8 +1090,18 @@ def main():
     ap.add_argument("--limit", type=int, default=0, help="stop after N papers")
     ap.add_argument("--no-publisher", action="store_true",
                     help="do not follow DOIs to publisher sites")
+    ap.add_argument("--retry-after-days", type=float, default=None, metavar="D",
+                    help="skip papers a run already tried in the last D days "
+                         "(default: limits.retry_after_days in the yaml, else 0 = off)")
+    ap.add_argument("--force", action="store_true",
+                    help="ignore the retry-after-days cooldown")
+    ap.add_argument("--allow-short-pdf", action="store_true",
+                    help="file 1-page pdfs from _inbox too (held back by default)")
     ap.add_argument("--open", type=int, default=0, metavar="N",
-                    help="open the next N unsaved papers in your browser, then stop")
+                    help="open the next N papers without a pdf in your browser; "
+                         "each paper is opened once, then it says DONE")
+    ap.add_argument("--again", action="store_true",
+                    help="with --open: go through papers already opened once")
     args = ap.parse_args()
 
     c = load_crawler(args.crawler)
@@ -748,11 +1112,29 @@ def main():
 
     papers, edges, runs = c.load_state(cfg)
     if args.open:
-        return open_in_browser(c, cfg, papers, args.open)
+        return open_in_browser(c, cfg, papers, args.open, args)
     backup = backup_state(c, cfg)
+    days = args.retry_after_days
+    if days is None:
+        days = float(cfg["limits"].get("retry_after_days") or 0)
+    # read the cooldown before a rotation can move the log away
+    cooling = set() if args.force else recently_tried(
+        c.state_path(cfg, "fulltext_fill_log.csv"), days)
+    rotated = rotate_log(c, cfg)
     run = Fill(c, cfg, args)
+    if importlib.util.find_spec("pypdf") is None:
+        print("pypdf is not installed: _inbox pdfs are matched by file name only, "
+              "and 1-page pdfs are not held back  (pip install pypdf)")
+    elif importlib.util.find_spec("cryptography") is None:
+        print("cryptography is not installed: AES-encrypted pdfs cannot be opened, so "
+              "they are matched by file name only and 1-page ones are not held back  "
+              '(pip install "pypdf[crypto]")')
     inbox = run.scan_inbox(papers)
     inbox_seen = sum(len(v) for v in inbox.values()) + len(run.inbox_left)
+    for key, files in inbox.items():
+        if not papers[key].get("paper_folder"):
+            run.inbox_left += [f"{p.name} - its paper has no folder (metadata never parsed)"
+                               for p in files]
 
     def wanted(e):
         if not e.get("paper_folder"):
@@ -760,6 +1142,8 @@ def main():
         if e["key"] in inbox:
             return True
         if args.inbox_only:
+            return False
+        if e["key"] in cooling:
             return False
         if e.get("status") in TODO:
             return True
@@ -778,6 +1162,11 @@ def main():
           f"({sum(e.get('status') != 'ok' for e in tried)} not saved) "
           f"| _inbox {inbox_seen} file(s)")
     print(f"undo   {backup}  (the ledger as it was before this run)")
+    if cooling:
+        print(f"cooldown {len(cooling)} paper(s) tried within {days:g} day(s) are left alone "
+              "(--force to retry them)")
+    if rotated:
+        print(f"log      the old log was past {ROTATE_LOG_ROWS} rows and moved to {rotated}")
 
     if not args.inbox_only:
         blank = [e for e in tried if not e.get("pmcid") and e.get("pmid")]
@@ -800,7 +1189,8 @@ def main():
     runs.append(row)
     c.save_state(cfg, papers, edges, runs)
     run.flush_log(log_path)
-    log = pd.read_csv(log_path, dtype=str).fillna("")
+    log = (pd.read_csv(log_path, dtype=str).fillna("") if log_path.exists()
+           else pd.DataFrame(columns=LOG_COLUMNS))
 
     excel = write_excel(c, cfg, log, papers, edges, runs)
     c.write_branch_manifests(cfg, papers, edges)
